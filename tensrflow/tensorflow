@@ -1,0 +1,177 @@
+import os
+import cv2
+import numpy as np
+import time
+from threading import Thread
+import tensorflow as tf
+
+# VideoStream class to handle streaming of video from webcam in separate processing thread
+class VideoStream:
+    def __init__(self, resolution=(640, 480), framerate=30):
+        self.stream = cv2.VideoCapture(0)
+        ret = self.stream.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        ret = self.stream.set(3, resolution[0])
+        ret = self.stream.set(4, resolution[1])
+        (self.grabbed, self.frame) = self.stream.read()
+        self.stopped = False
+
+    def start(self):
+        Thread(target=self.update, args=()).start()
+        return self
+
+    def update(self):
+        while True:
+            if self.stopped:
+                self.stream.release()
+                return
+            (self.grabbed, self.frame) = self.stream.read()
+
+    def read(self):
+        return self.frame
+
+    def stop(self):
+        self.stopped = True
+
+# Define and parse input arguments
+MODEL_NAME = "custom_model_lite"
+GRAPH_NAME = "detect.tflite"
+LABELMAP_NAME = "labelmap.txt"
+min_conf_threshold = 0.5
+imW, imH = 1280, 720
+use_TPU = False
+
+# Get path to current working directory
+CWD_PATH = os.getcwd()
+
+# Path to .tflite file, which contains the model that is used for object detection
+PATH_TO_CKPT = os.path.join(MODEL_NAME, GRAPH_NAME)
+
+# Path to label map file
+PATH_TO_LABELS = os.path.join(MODEL_NAME, LABELMAP_NAME)
+
+# Load the TensorFlow Lite model and allocate tensors
+interpreter = tf.lite.Interpreter(model_path=PATH_TO_CKPT)
+interpreter.allocate_tensors()
+
+# Load the label map
+with open(PATH_TO_LABELS, 'r') as f:
+    labels = [line.strip() for line in f.readlines()]
+
+if labels[0] == '???':
+    del(labels[0])
+
+# Get model details
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+height = input_details[0]['shape'][1]
+width = input_details[0]['shape'][2]
+
+floating_model = (input_details[0]['dtype'] == np.float32)
+
+input_mean = 127.5
+input_std = 127.5
+
+outname = output_details[0]['name']
+
+if 'StatefulPartitionedCall' in outname:
+    boxes_idx, classes_idx, scores_idx = 1, 3, 0
+else:
+    boxes_idx, classes_idx, scores_idx = 0, 1, 2
+
+# Initialize frame rate calculation
+frame_rate_calc = 1
+freq = cv2.getTickFrequency()
+
+# Initialize video stream
+videostream = VideoStream(resolution=(imW, imH), framerate=30).start()
+time.sleep(1)
+
+# Threshold distance for identifying new balloons
+threshold_distance = 125
+
+# Dictionaries for storing previous balloon data and movement vectors
+previous_balloons = {}
+
+while True:
+    t1 = cv2.getTickCount()
+
+    frame1 = videostream.read()
+
+    frame = frame1.copy()
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_resized = cv2.resize(frame_rgb, (width, height))
+    input_data = np.expand_dims(frame_resized, axis=0)
+
+    if floating_model:
+        input_data = (np.float32(input_data) - input_mean) / input_std
+
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+
+    boxes = interpreter.get_tensor(output_details[boxes_idx]['index'])[0]
+    classes = interpreter.get_tensor(output_details[classes_idx]['index'])[0]
+    scores = interpreter.get_tensor(output_details[scores_idx]['index'])[0]
+
+    balloon_data = {}
+
+    for i in range(len(scores)):
+        if ((scores[i] > min_conf_threshold) and (scores[i] <= 1.0)):
+
+            ymin = int(max(1, (boxes[i][0] * imH)))
+            xmin = int(max(1, (boxes[i][1] * imW)))
+            ymax = int(min(imH, (boxes[i][2] * imH)))
+            xmax = int(min(imW, (boxes[i][3] * imW)))
+            
+            center_x = int((xmin + xmax) / 2)
+            center_y = int((ymin + ymax) / 2)
+
+            new_center = (center_x, center_y)
+            closest_balloon_id = None
+            min_distance = float('inf')
+
+            for balloon_id, (last_center, _, _) in previous_balloons.items():
+                distance = abs(last_center[0] - new_center[0]) + abs(last_center[1] - new_center[1])
+                if distance < min_distance:
+                    closest_balloon_id = balloon_id
+                    min_distance = distance
+
+            if min_distance > threshold_distance or closest_balloon_id is None:
+                balloon_data[len(balloon_data) + 1] = (new_center, scores[i], (255, 0, 0))
+            else:
+                balloon_data[closest_balloon_id] = (new_center, scores[i], (255, 0, 0))
+
+    for balloon_id, (center, confidence, color) in balloon_data.items():
+        cv2.circle(frame, center, 50, (0, 0, 255), -1)
+        cv2.putText(frame, f"ID: {balloon_id}", (center[0] - 10, center[1] - 20), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 4, cv2.LINE_AA)
+
+        radius = 100
+        box_xmin = center[0] - radius
+        box_ymin = center[1] - radius
+        box_xmax = center[0] + radius
+        box_ymax = center[1] + radius
+
+        cv2.rectangle(frame, (box_xmin, box_ymin), (box_xmax, box_ymax), color, 2)
+        cv2.putText(frame, f"{confidence:.2f}", (box_xmin, box_ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 2, color, 2, cv2.LINE_AA)
+
+    previous_balloons = balloon_data
+
+    sorted_balloon_ids = sorted(list(previous_balloons.keys()))
+
+    if sorted_balloon_ids:
+        smallest_center = previous_balloons[sorted_balloon_ids[0]][0]
+        print(f"ID Numarasi En Kucuk Balonun orta nokta koordinatlari: {smallest_center}")
+        print(f"Tespit edilen balon sayisi: {len(sorted_balloon_ids)}")
+
+    cv2.putText(frame, f"FPS: {frame_rate_calc:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+
+    cv2.imshow('Object Detection', frame)
+
+    if cv2.waitKey(1) == ord('q'):
+        break
+
+    t2 = cv2.getTickCount()
+    time1 = (t2 - t1) / freq
+    frame_rate_calc = 1 / time1
+
+cv2.destroyAllWindows()
+videostream.stop()
